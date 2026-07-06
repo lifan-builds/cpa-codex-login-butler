@@ -1,0 +1,10 @@
+#!/usr/bin/env python3
+from pathlib import Path
+import sys
+
+repo = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(repo / "src"))
+
+from cpa_codex_butler.cli import main
+
+raise SystemExit(main())

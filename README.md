@@ -11,14 +11,15 @@ manual.
 ## Run
 
 ```bash
-/Users/lfan/Project/agent/cpa-codex-login-butler/bin/cpa-codex-butler status
-/Users/lfan/Project/agent/cpa-codex-login-butler/bin/cpa-codex-butler fix
+python -m pip install -e .
+cpa-codex-butler status
+cpa-codex-butler fix
 ```
 
-Optional alias:
+For a checkout-only run without installing:
 
 ```bash
-alias cpa-codex-butler="/Users/lfan/Project/agent/cpa-codex-login-butler/bin/cpa-codex-butler"
+./bin/cpa-codex-butler status
 ```
 
 ## Daily Commands
@@ -56,7 +57,7 @@ cpa-codex-butler fix --yes
 Login one email, cleaning bad files for that email first:
 
 ```bash
-cpa-codex-butler login xinyiw9596@gmail.com --clean
+cpa-codex-butler login user@example.com --clean
 ```
 
 Refresh the saved roster only when accounts/seats intentionally change:
@@ -68,7 +69,7 @@ cpa-codex-butler roster sync
 Set expected seats:
 
 ```bash
-cpa-codex-butler roster set gameoflifan@gmail.com --seats 2
+cpa-codex-butler roster set user@example.com --seats 2
 ```
 
 ## Safety

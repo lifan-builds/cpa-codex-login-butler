@@ -1,9 +1,9 @@
 # CPA Codex Login Butler
 
 A local helper for repeated Codex OAuth re-login through CLIProxyAPI (CPA). It
-keeps your saved roster stable, reads live CPA auth status, quarantines bad auth
-files outside CPA's auth directory, and opens OAuth login URLs with the right
-email hint.
+reads current CPA Codex auth files, merges live CPA auth status, quarantines bad
+auth files outside CPA's auth directory, and opens OAuth login URLs with the
+right email hint.
 
 It does **not** automate email, SMS, phone, or account verification. Those stay
 manual.
@@ -13,7 +13,7 @@ manual.
 ```bash
 python -m pip install -e .
 cpa-codex-butler status
-cpa-codex-butler fix
+cpa-codex-butler queue
 ```
 
 For a checkout-only run without installing:
@@ -24,7 +24,7 @@ For a checkout-only run without installing:
 
 ## Daily Commands
 
-Show accounts that need login:
+Show current auth files that need login:
 
 ```bash
 cpa-codex-butler status
@@ -39,55 +39,32 @@ cpa-codex-butler status --all
 Preview cleanup and login queue:
 
 ```bash
-cpa-codex-butler fix --dry-run
+cpa-codex-butler queue --dry-run
 ```
 
 Quarantine invalid auth files and walk through manual re-login:
 
 ```bash
-cpa-codex-butler fix
+cpa-codex-butler queue
 ```
 
 Skip per-account prompts:
 
 ```bash
-cpa-codex-butler fix --yes
+cpa-codex-butler queue --yes
 ```
 
-Login one email, cleaning bad files for that email first:
+Queue a specific email. If no bad auth file exists for that email, this creates
+a one-attempt manual login row:
 
 ```bash
-cpa-codex-butler login user@example.com --clean
-```
-
-Refresh the saved roster only when accounts/seats intentionally change:
-
-```bash
-cpa-codex-butler roster sync
-```
-
-Set expected seats:
-
-```bash
-cpa-codex-butler roster set user@example.com --seats 2
+cpa-codex-butler queue --email user@example.com
 ```
 
 ## Safety
 
 - Reads only top-level `codex-*.json` files from `~/.cli-proxy-api`.
-- Stores roster metadata under `~/.cli-proxy-api-state/codex-login-butler`.
 - Quarantines bad auth files under `~/.cli-proxy-api-state/codex-login-butler/quarantine/`, outside CPA's scanned auth directory.
 - Never copies token files back into CPA automatically.
 - Uses CPA Management `/v0/management/auth-files` for live runtime auth status.
-- Treats `auth_unavailable`, `authentication_error`, invalidated-token text, disabled records, or missing token fields as re-login signals.
-
-## Compatibility
-
-The old command names still work:
-
-```bash
-cpa-codex-butler status --needs-login
-cpa-codex-butler queue --needs-login
-cpa-codex-butler update-roster
-cpa-codex-butler set user@example.com --expected-seats 1
-```
+- Treats `auth_unavailable`, `authentication_error`, invalidated-token text, disabled records, or missing access tokens as re-login signals.

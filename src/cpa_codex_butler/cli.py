@@ -45,10 +45,6 @@ class Config:
     cpa_config: Path
     timeout: int = 5
 
-    @property
-    def state_path(self) -> Path:
-        return self.state_dir / "accounts.json"
-
 
 def default_state_dir() -> Path:
     configured = os.environ.get("CPA_CODEX_BUTLER_STATE_DIR") or os.environ.get(
@@ -70,10 +66,6 @@ def make_config(args: argparse.Namespace) -> Config:
         cpa_config=Path(args.cpa_config or cpa_dir / "config.yaml").expanduser(),
         timeout=args.timeout,
     )
-
-
-def now_iso() -> str:
-    return dt.datetime.now(dt.timezone.utc).astimezone().isoformat(timespec="seconds")
 
 
 def account_hash(account_id: str) -> str:
@@ -113,20 +105,6 @@ def load_auth_records(config: Config) -> list[dict[str, Any]]:
             }
         )
     return records
-
-
-def load_state(config: Config) -> dict[str, Any]:
-    if not config.state_path.exists():
-        return {"version": 1, "accounts": {}, "updated_at": ""}
-    return json.loads(config.state_path.read_text())
-
-
-def save_state(config: Config, state: dict[str, Any]) -> None:
-    config.state_dir.mkdir(parents=True, exist_ok=True)
-    tmp = config.state_path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state, indent=2, sort_keys=True))
-    os.replace(tmp, config.state_path)
-    os.chmod(config.state_path, 0o600)
 
 
 def read_management_secret(config: Config) -> str:
@@ -268,7 +246,6 @@ def record_is_usable(record: dict[str, Any]) -> bool:
         and not record.get("cpa_disabled")
         and not needs_relogin(record)
         and record.get("has_access_token")
-        and record.get("has_refresh_token")
     )
 
 
@@ -278,90 +255,50 @@ def record_needs_cleanup(record: dict[str, Any]) -> bool:
         or bool(record.get("cpa_disabled"))
         or needs_relogin(record)
         or not record.get("has_access_token")
-        or not record.get("has_refresh_token")
     )
 
 
-def need_rows(state: dict[str, Any], records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    grouped = records_by_email(records)
+def record_reason_keys(record: dict[str, Any]) -> list[str]:
+    reasons = []
+    if record.get("disabled"):
+        reasons.append("disabled")
+    if record.get("cpa_disabled"):
+        reasons.append("cpa_disabled")
+    if needs_relogin(record):
+        reasons.append("auth_401")
+    if not record.get("has_access_token"):
+        reasons.append("missing_access_token")
+    return reasons
+
+
+def summarize_reasons(records: list[dict[str, Any]]) -> str:
+    counts: dict[str, int] = {}
+    for record in records:
+        for reason in record_reason_keys(record):
+            counts[reason] = counts.get(reason, 0) + 1
+    return ", ".join(f"{reason} {count}" for reason, count in counts.items()) or "requested"
+
+
+def queue_rows(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     rows = []
-    for email, account in sorted(state.get("accounts", {}).items()):
-        email_records = grouped.get(email, [])
-        usable = [record for record in email_records if record_is_usable(record)]
-        expected = int(account.get("expected_seats") or 1)
-        disabled = [record for record in email_records if record.get("disabled")]
-        cpa_disabled = [record for record in email_records if record.get("cpa_disabled")]
-        cpa_401 = [record for record in email_records if needs_relogin(record)]
-        invalid = [record for record in email_records if not record.get("has_access_token") or not record.get("has_refresh_token")]
-        missing = max(0, expected - len(usable))
-        if not (missing or disabled or cpa_disabled or cpa_401 or invalid):
+    for email, email_records in sorted(records_by_email(records).items()):
+        bad_records = [record for record in email_records if record_needs_cleanup(record)]
+        if not bad_records:
             continue
-        reasons = []
-        if missing:
-            reasons.append(f"missing {missing}/{expected}")
-        if disabled:
-            reasons.append(f"disabled {len(disabled)}")
-        if cpa_disabled:
-            reasons.append(f"cpa_disabled {len(cpa_disabled)}")
-        if cpa_401:
-            reasons.append(f"auth_401 {len(cpa_401)}")
-        if invalid:
-            reasons.append(f"missing_token {len(invalid)}")
         rows.append(
             {
                 "email": email,
-                "expected": expected,
-                "usable": len(usable),
-                "attempts": max(missing, 1 if disabled or cpa_disabled or cpa_401 or invalid else 0),
-                "reason": ", ".join(reasons),
+                "bad_files": len(bad_records),
+                "usable": sum(1 for record in email_records if record_is_usable(record)),
+                "attempts": max(len(bad_records), 1),
+                "reason": summarize_reasons(bad_records),
             }
         )
     return rows
 
 
-def update_roster(config: Config) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    state = load_state(config)
-    accounts = state.setdefault("accounts", {})
-    records = load_auth_records(config)
-    seen_seats: dict[str, set[str]] = {}
-    for record in records:
-        email = record.get("email")
-        if not email:
-            continue
-        seen_seats.setdefault(email, set()).add(record["account_id_hash"])
-        account = accounts.setdefault(
-            email,
-            {
-                "email": email,
-                "label": email.split("@", 1)[0],
-                "expected_seats": 1,
-                "phone_hint": "",
-                "email_hint": "",
-                "browser_profile": "",
-                "notes": "",
-                "created_at": now_iso(),
-            },
-        )
-        seat = account.setdefault("seats", {}).setdefault(
-            record["account_id_hash"],
-            {"seat": record["account_id_hash"], "label": f"seat-{record['account_id_hash']}", "created_at": now_iso()},
-        )
-        seat.update(
-            {
-                "file": record["file"],
-                "disabled": record["disabled"],
-                "expired": record["expired"],
-                "last_refresh": record["last_refresh"],
-                "has_access_token": record["has_access_token"],
-                "has_refresh_token": record["has_refresh_token"],
-                "seen_at": now_iso(),
-            }
-        )
-    for email, seats in seen_seats.items():
-        accounts[email]["expected_seats"] = max(int(accounts[email].get("expected_seats") or 1), len(seats))
-    state["updated_at"] = now_iso()
-    save_state(config, state)
-    return state, records
+def manual_queue_row(email: str) -> dict[str, Any]:
+    return {"email": email, "bad_files": 0, "usable": 0, "attempts": 1, "reason": "requested"}
 
 
 def print_table(rows: list[list[Any]], headers: list[str]) -> None:
@@ -381,15 +318,15 @@ def print_table(rows: list[list[Any]], headers: list[str]) -> None:
 def show_needs(rows: list[dict[str, Any]], warning: str = "") -> None:
     if rows:
         print_table(
-            [[row["email"], row["expected"], row["usable"], row["attempts"], row["reason"]] for row in rows],
-            ["email", "expected", "usable", "logins", "reason"],
+            [[row["email"], row["bad_files"], row["usable"], row["attempts"], row["reason"]] for row in rows],
+            ["email", "bad_files", "usable", "logins", "reason"],
         )
         return
     if warning:
-        print("No static missing/disabled/token-invalid accounts detected.")
+        print("No local missing/disabled/token-invalid auth files detected.")
         print(f"Live CPA status was unavailable: {warning}")
     else:
-        print("All saved accounts look OK. No login needed.")
+        print("All current auth files look OK. No login needed.")
 
 
 def quarantine_root(config: Config) -> Path:
@@ -567,38 +504,36 @@ def login_once(config: Config, args: argparse.Namespace, email: str) -> None:
         if attempt < attempts:
             print(f"Waiting {args.wait}s before second login...")
             time.sleep(args.wait)
-    update_roster(config)
     show_changed(config, changed_files(config, before))
 
 
 def cmd_status(args: argparse.Namespace) -> int:
     config = make_config(args)
-    if getattr(args, "update_roster", False):
-        update_roster(config)
-    state = load_state(config)
     records, warning = live_records(config, args.offline)
-    rows = need_rows(state, records)
+    rows = queue_rows(records)
 
     if args.all:
         all_rows = []
         for email, email_records in sorted(records_by_email(records).items()):
             email_records.sort(key=lambda item: (item.get("account_id_hash"), item.get("file")))
-            expected = state.get("accounts", {}).get(email, {}).get("expected_seats", "")
             for index, record in enumerate(email_records):
                 all_rows.append(
                     [
                         email if index == 0 else "",
-                        expected if index == 0 else "",
                         record.get("account_id_hash", ""),
                         "yes" if record.get("disabled") else "no",
                         record.get("cpa_status") or "<unknown>",
                         record.get("cpa_error") or "",
+                        "yes" if record.get("has_access_token") else "no",
                         "yes" if record.get("has_refresh_token") else "no",
                         record.get("last_refresh") or "<missing>",
                         record.get("file") or "",
                     ]
                 )
-        print_table(all_rows, ["email", "expected", "seat", "disabled", "cpa_status", "cpa_error", "refresh", "last_refresh", "file"])
+        print_table(
+            all_rows,
+            ["email", "seat", "disabled", "cpa_status", "cpa_error", "access", "refresh", "last_refresh", "file"],
+        )
         if warning:
             print(f"\nLive CPA status unavailable: {warning}")
         print("\nNeeds login:")
@@ -606,17 +541,28 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_fix(args: argparse.Namespace) -> int:
+def selected_queue_rows(records: list[dict[str, Any]], emails: list[str] | None) -> list[dict[str, Any]]:
+    rows = queue_rows(records)
+    if not emails:
+        return rows
+    selected = set(emails)
+    filtered = [row for row in rows if row["email"] in selected]
+    queued = {row["email"] for row in filtered}
+    for email in emails:
+        if email not in queued:
+            filtered.append(manual_queue_row(email))
+            queued.add(email)
+    return filtered
+
+
+def cmd_queue(args: argparse.Namespace) -> int:
     config = make_config(args)
-    state = load_state(config)
     records, warning = live_records(config, args.offline)
     if warning:
         print(f"Live CPA status unavailable ({warning}); falling back to local auth files.")
-    rows = need_rows(state, records)
-    selected = set(args.email or [row["email"] for row in rows])
-    rows = [row for row in rows if row["email"] in selected]
+    rows = selected_queue_rows(records, args.email)
     if not rows:
-        print("No matching accounts need login.")
+        print("No matching auth files need login.")
         return 0
 
     print("Needs login:")
@@ -625,14 +571,10 @@ def cmd_fix(args: argparse.Namespace) -> int:
     reasons_by_email = {row["email"]: row["reason"] for row in rows}
 
     for index, email in enumerate([row["email"] for row in rows], 1):
-        account = state.get("accounts", {}).get(email, {})
         print(f"\n[{index}/{len(rows)}] {email}")
         print(f"reason: {reasons_by_email[email]}")
-        for label in ("phone_hint", "email_hint", "notes"):
-            if account.get(label):
-                print(f"{label.replace('_', ' ')}: {account[label]}")
         attempts = attempts_by_email[email]
-        if not args.yes:
+        if not args.yes and not args.dry_run:
             answer = input(f"Quarantine bad files and run {attempts} login attempt(s)? [y/N/q] ").strip().lower()
             if answer == "q":
                 break
@@ -646,57 +588,6 @@ def cmd_fix(args: argparse.Namespace) -> int:
             if attempts > 1:
                 print(f"Seat login {attempt}/{attempts} for {email}")
             login_once(config, args, email)
-    return 0
-
-
-def cmd_login(args: argparse.Namespace) -> int:
-    config = make_config(args)
-    if args.clean:
-        records, warning = live_records(config, args.offline)
-        if warning:
-            print(f"Live CPA status unavailable ({warning}); using local auth-file cleanup only.")
-        clean_email(config, args.email, records, dry_run=args.dry_run)
-        if args.dry_run:
-            return 0
-    login_once(config, args, args.email)
-    return 0
-
-
-def cmd_roster_sync(args: argparse.Namespace) -> int:
-    config = make_config(args)
-    state, records = update_roster(config)
-    print(f"Synced {len(records)} Codex auth records into {config.state_path}")
-    print(f"Accounts: {len(state.get('accounts', {}))}")
-    return 0
-
-
-def cmd_roster_set(args: argparse.Namespace) -> int:
-    config = make_config(args)
-    state = load_state(config)
-    account = state.setdefault("accounts", {}).setdefault(
-        args.email,
-        {
-            "email": args.email,
-            "label": args.email.split("@", 1)[0],
-            "phone_hint": "",
-            "email_hint": "",
-            "browser_profile": "",
-            "notes": "",
-            "created_at": now_iso(),
-            "seats": {},
-        },
-    )
-    if args.seats is not None:
-        if args.seats < 1:
-            raise SystemExit("--seats must be >= 1")
-        account["expected_seats"] = args.seats
-    for key in ("label", "phone_hint", "email_hint", "notes"):
-        value = getattr(args, key)
-        if value is not None:
-            account[key] = value
-    state["updated_at"] = now_iso()
-    save_state(config, state)
-    print(f"Updated {args.email} in {config.state_path}")
     return 0
 
 
@@ -732,54 +623,31 @@ def build_parser() -> argparse.ArgumentParser:
     add_global(parser)
     sub = parser.add_subparsers(dest="command", required=True)
 
-    status = sub.add_parser("status", help="Show accounts needing login. Use --all for full auth-file table.")
+    status = sub.add_parser("status", help="Show current auth files needing login. Use --all for full table.")
     status.add_argument("--all", action="store_true", help="Show every top-level Codex auth file.")
-    status.add_argument("--update-roster", action="store_true", help="Sync roster before status.")
+    status.add_argument("--offline", action="store_true", default=argparse.SUPPRESS, help="Skip CPA Management and use local auth JSON only.")
+    status.add_argument("--no-live-cpa", dest="offline", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     status.add_argument("--needs-login", action="store_true", help=argparse.SUPPRESS)
     status.add_argument("--verbose", action="store_true", help=argparse.SUPPRESS)
     status.set_defaults(func=cmd_status)
 
-    fix = sub.add_parser("fix", help="Quarantine bad auth files and walk the login queue.")
-    add_login_options(fix)
-    fix.add_argument("--email", action="append", help="Only process this email; can be repeated.")
-    fix.add_argument("--dry-run", action="store_true", help="Preview cleanup/login queue; do not move files or run login.")
-    fix.add_argument("--dry-run-clean-auth", dest="dry_run", action="store_true", help=argparse.SUPPRESS)
-    fix.add_argument("--keep-old", action="store_true", help="Do not quarantine old invalid auth files first.")
-    fix.add_argument("--no-clean-auth", dest="keep_old", action="store_true", help=argparse.SUPPRESS)
-    fix.add_argument("--yes", "-y", action="store_true", help="Do not prompt per account.")
-    fix.add_argument("--needs-login", action="store_true", help=argparse.SUPPRESS)
-    fix.set_defaults(func=cmd_fix)
-
-    login = sub.add_parser("login", help="Login one email manually.")
-    login.add_argument("email", nargs="?", help="Email to hint on the OAuth URL.")
-    login.add_argument("--login-hint", dest="legacy_login_hint", help=argparse.SUPPRESS)
-    add_login_options(login)
-    login.add_argument("--clean", action="store_true", help="Quarantine bad files for this email before login.")
-    login.add_argument("--dry-run", action="store_true", help="With --clean, preview cleanup and do not login.")
-    login.set_defaults(func=cmd_login)
-
-    roster = sub.add_parser("roster", help="Manage saved account roster.")
-    roster_sub = roster.add_subparsers(dest="roster_command", required=True)
-    roster_sync = roster_sub.add_parser("sync", help="Refresh saved roster from current auth files.")
-    roster_sync.set_defaults(func=cmd_roster_sync)
-    roster_set = roster_sub.add_parser("set", help="Set notes or expected seats for an email.")
-    roster_set.add_argument("email")
-    roster_set.add_argument("--seats", type=int, help="Expected seat count.")
-    roster_set.add_argument("--expected-seats", dest="seats", type=int, help=argparse.SUPPRESS)
-    roster_set.add_argument("--label")
-    roster_set.add_argument("--phone-hint")
-    roster_set.add_argument("--email-hint")
-    roster_set.add_argument("--notes")
-    roster_set.set_defaults(func=cmd_roster_set)
+    queue = sub.add_parser("queue", help="Quarantine bad auth files and walk the login queue.")
+    queue.add_argument("--offline", action="store_true", default=argparse.SUPPRESS, help="Skip CPA Management and use local auth JSON only.")
+    queue.add_argument("--no-live-cpa", dest="offline", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    add_login_options(queue)
+    queue.add_argument("--email", action="append", help="Only process this email; can be repeated.")
+    queue.add_argument("--dry-run", action="store_true", help="Preview cleanup/login queue; do not move files or run login.")
+    queue.add_argument("--dry-run-clean-auth", dest="dry_run", action="store_true", help=argparse.SUPPRESS)
+    queue.add_argument("--keep-old", action="store_true", help="Do not quarantine old invalid auth files first.")
+    queue.add_argument("--no-clean-auth", dest="keep_old", action="store_true", help=argparse.SUPPRESS)
+    queue.add_argument("--yes", "-y", action="store_true", help="Do not prompt per account.")
+    queue.add_argument("--needs-login", action="store_true", help=argparse.SUPPRESS)
+    queue.set_defaults(func=cmd_queue)
 
     return parser
 
 
 def normalize_args(args: argparse.Namespace) -> None:
-    if getattr(args, "legacy_login_hint", None) and not args.email:
-        args.email = args.legacy_login_hint
-    if getattr(args, "command", "") == "login" and not args.email:
-        raise SystemExit("login requires EMAIL, e.g. cpa-codex-butler login user@example.com")
     for name, value in {
         "dry_run": False,
         "keep_old": False,
@@ -795,26 +663,11 @@ def normalize_args(args: argparse.Namespace) -> None:
             setattr(args, name, value)
 
 
-def normalize_legacy_argv(argv: list[str] | None) -> list[str] | None:
-    if argv is None:
-        return None
-    if not argv:
-        return argv
-    first = argv[0]
-    if first == "queue":
-        return ["fix", *argv[1:]]
-    if first in {"update-roster", "sync"}:
-        return ["roster", "sync", *argv[1:]]
-    if first == "set":
-        return ["roster", "set", *argv[1:]]
-    return argv
-
-
 def main(argv: list[str] | None = None) -> int:
     import sys
 
     parser = build_parser()
-    args = parser.parse_args(normalize_legacy_argv(list(sys.argv[1:] if argv is None else argv)))
+    args = parser.parse_args(list(sys.argv[1:] if argv is None else argv))
     normalize_args(args)
     return int(args.func(args) or 0)
 

@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -440,7 +441,7 @@ def changed_files(config: Config, before: dict[str, float]) -> list[Path]:
     return changed
 
 
-def run_cpa_login(config: Config, args: argparse.Namespace, email: str = "") -> int:
+def login_command(config: Config, args: argparse.Namespace) -> list[str]:
     binary = shutil.which(args.binary)
     if not binary:
         raise SystemExit(f"Could not find {args.binary!r} on PATH")
@@ -453,6 +454,11 @@ def run_cpa_login(config: Config, args: argparse.Namespace, email: str = "") -> 
         if args.port:
             command.extend(["--oauth-callback-port", str(args.port)])
     command.extend(["-config", str(config.cpa_config)])
+    return command
+
+
+def run_cpa_login(config: Config, args: argparse.Namespace, email: str = "") -> int:
+    command = login_command(config, args)
 
     print("Running:", " ".join(command))
     print("Complete email/SMS/phone verification manually in the browser when prompted.")
@@ -505,6 +511,76 @@ def login_once(config: Config, args: argparse.Namespace, email: str) -> None:
             print(f"Waiting {args.wait}s before second login...")
             time.sleep(args.wait)
     show_changed(config, changed_files(config, before))
+
+
+def batch_login_items(rows: list[dict[str, Any]]) -> list[tuple[str, int, int]]:
+    items = []
+    for row in rows:
+        attempts = int(row["attempts"])
+        for attempt in range(1, attempts + 1):
+            items.append((row["email"], attempt, attempts))
+    return items
+
+
+def stream_batch_login_output(
+    process: subprocess.Popen[str],
+    args: argparse.Namespace,
+    email: str,
+    label: str,
+    print_lock: threading.Lock,
+) -> None:
+    opened = False
+    assert process.stdout is not None
+    for line in process.stdout:
+        with print_lock:
+            print(f"{label} {line}", end="")
+        if opened or args.device or args.print_url:
+            continue
+        for url in extract_urls(line):
+            browser_url = hinted_login_url(url, email)
+            if open_url(browser_url):
+                with print_lock:
+                    print(f"{label} Opened browser with login hint for {email}.")
+                opened = True
+                break
+
+
+def run_batch_logins(config: Config, args: argparse.Namespace, items: list[tuple[str, int, int]]) -> int:
+    if args.port and len(items) > 1:
+        raise SystemExit("Batch mode cannot reuse one --port for multiple login attempts; omit --port or run without --batch.")
+
+    before = snapshot_files(config)
+    print_lock = threading.Lock()
+    processes: list[tuple[str, subprocess.Popen[str], threading.Thread]] = []
+    total = len(items)
+    for index, (email, attempt, attempts) in enumerate(items, 1):
+        label = f"[{index}/{total}] {email}"
+        if attempts > 1:
+            label = f"{label} login {attempt}/{attempts}"
+        command = login_command(config, args)
+        print(f"Starting {label}: {' '.join(command)}")
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+        thread = threading.Thread(
+            target=stream_batch_login_output,
+            args=(process, args, email, label, print_lock),
+            daemon=True,
+        )
+        thread.start()
+        processes.append((label, process, thread))
+
+    statuses = []
+    for label, process, _thread in processes:
+        statuses.append((label, process.wait()))
+    for _label, _process, thread in processes:
+        thread.join()
+
+    show_changed(config, changed_files(config, before))
+    failed = [(label, status) for label, status in statuses if status != 0]
+    if failed:
+        for label, status in failed:
+            print(f"{label} exited with status {status}.")
+        return failed[0][1]
+    return 0
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -569,6 +645,21 @@ def cmd_queue(args: argparse.Namespace) -> int:
     show_needs(rows)
     attempts_by_email = {row["email"]: int(row["attempts"]) for row in rows}
     reasons_by_email = {row["email"]: row["reason"] for row in rows}
+
+    if args.batch:
+        items = batch_login_items(rows)
+        action = "Start" if args.keep_old else "Quarantine bad files and start"
+        if not args.yes and not args.dry_run:
+            answer = input(f"{action} {len(items)} login attempt(s) for {len(rows)} account(s) at once? [y/N] ").strip().lower()
+            if answer != "y":
+                return 0
+        for row in rows:
+            if not args.keep_old:
+                clean_email(config, row["email"], records, dry_run=args.dry_run)
+        if args.dry_run:
+            print(f"Would start {len(items)} login attempt(s) at once.")
+            return 0
+        return run_batch_logins(config, args, items)
 
     for index, email in enumerate([row["email"] for row in rows], 1):
         print(f"\n[{index}/{len(rows)}] {email}")
@@ -638,6 +729,7 @@ def build_parser() -> argparse.ArgumentParser:
     queue.add_argument("--email", action="append", help="Only process this email; can be repeated.")
     queue.add_argument("--dry-run", action="store_true", help="Preview cleanup/login queue; do not move files or run login.")
     queue.add_argument("--dry-run-clean-auth", dest="dry_run", action="store_true", help=argparse.SUPPRESS)
+    queue.add_argument("--batch", action="store_true", help="Start all selected login attempts at once.")
     queue.add_argument("--keep-old", action="store_true", help="Do not quarantine old invalid auth files first.")
     queue.add_argument("--no-clean-auth", dest="keep_old", action="store_true", help=argparse.SUPPRESS)
     queue.add_argument("--yes", "-y", action="store_true", help="Do not prompt per account.")
@@ -650,6 +742,7 @@ def build_parser() -> argparse.ArgumentParser:
 def normalize_args(args: argparse.Namespace) -> None:
     for name, value in {
         "dry_run": False,
+        "batch": False,
         "keep_old": False,
         "yes": False,
         "print_url": False,

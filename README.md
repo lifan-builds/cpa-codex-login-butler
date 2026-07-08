@@ -54,6 +54,12 @@ Skip per-account prompts:
 cpa-codex-butler queue --yes
 ```
 
+Start all selected login attempts at once:
+
+```bash
+cpa-codex-butler queue --batch
+```
+
 Queue a specific email. If no bad auth file exists for that email, this creates
 a one-attempt manual login row:
 
